@@ -2,7 +2,6 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![OpenClaw Skill](https://img.shields.io/badge/OpenClaw-Skill-success.svg)](https://github.com/twbeatles/openclaw-naver-real-estate-search)
-[![Architecture](https://img.shields.io/badge/CodeGraph-Indexed-purple.svg)](https://github.com/twbeatles/openclaw-naver-real-estate-search)
 
 OpenClaw 및 독립 Python 환경에서 동작하는 **대한민국 네이버 부동산 매물 탐색 / 단지 비교 / 대화형 브리핑 / 시세 감시 스킬**입니다.
 
@@ -43,7 +42,7 @@ OpenClaw 및 독립 Python 환경에서 동작하는 **대한민국 네이버 �
 
 ## 시스템 아키텍처
 
-CodeGraph를 통해 분석된 이 프로젝트의 모듈별 연결 관계와 데이터 흐름입니다.
+스킬을 구성하는 핵심 모듈 간 연결 관계와 데이터 흐름입니다.
 
 ```mermaid
 flowchart TD
