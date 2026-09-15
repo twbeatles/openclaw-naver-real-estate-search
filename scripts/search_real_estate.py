@@ -13,10 +13,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from runtime_paths import SKILL_ROOT, UPSTREAM, WORKSPACE
+
 BROWSER_FALLBACK_IMPORT_ERROR: Exception | None = None
 
-WORKSPACE = Path(__file__).resolve().parents[3]
-UPSTREAM = WORKSPACE / "tmp" / "naverland-scrapper"
 SRC_ROOT = UPSTREAM / "src"
 if str(UPSTREAM) not in sys.path:
     sys.path.insert(0, str(UPSTREAM))
@@ -27,7 +27,7 @@ UPSTREAM_IMPORT_ERROR: Exception | None = None
 try:
     from src.core.parser import NaverURLParser
     from src.core.services.response_capture import normalize_article_payload
-    from src.utils.helpers import PriceConverter, get_article_url
+    from src.utils.helpers import PriceConverter, build_complex_url, get_article_url
 except Exception as exc:
     UPSTREAM_IMPORT_ERROR = exc
 
@@ -51,31 +51,48 @@ except Exception as exc:
     class PriceConverter:
         @staticmethod
         def to_int(value: Any) -> int:
-            raw = str(value or "").strip()
+            raw = str(value or "").replace(",", "").replace(" ", "").strip()
             if not raw:
                 return 0
-            digits = re.sub(r"[^0-9]", "", raw)
-            return int(digits) if digits else 0
+            if "억" in raw:
+                head, _, tail = raw.partition("억")
+                try:
+                    eok = int(float(head)) * 10000
+                except ValueError:
+                    eok = 0
+                try:
+                    man = int(float(tail.replace("만", "").strip() or 0))
+                except ValueError:
+                    man = 0
+                return eok + man
+            try:
+                return int(float(raw.replace("만", "")))
+            except ValueError:
+                return 0
 
         @staticmethod
         def to_string(value: Any) -> str:
             amount = PriceConverter.to_int(value)
             if amount <= 0:
                 return "0"
-            eok = amount // 100000000
-            rem = amount % 100000000
-            man = rem // 10000
+            eok = amount // 10000
+            man = amount % 10000
             if eok and man:
                 return f"{eok}억 {man:,}만"
             if eok:
                 return f"{eok}억"
             return f"{man:,}만"
 
-    def get_article_url(complex_id: str, article_id: str, real_estate_type: str = "APT") -> str:
+    def build_complex_url(complex_id: str, *, asset_type: str = "APT", preferred_family: str = "new") -> str:
+        path = "houses" if str(asset_type).upper() == "VL" else "complexes"
+        host = "m.land.naver.com" if preferred_family == "m" else "new.land.naver.com"
+        return f"https://{host}/{path}/{complex_id}" if str(complex_id).strip() else ""
+
+    def get_article_url(complex_id: str, article_id: str, asset_type: str = "APT") -> str:
         article = str(article_id or "").strip()
         if not article:
             return ""
-        return f"https://new.land.naver.com/articles/{article}?complexNo={complex_id}&realEstateType={real_estate_type}"
+        return f"https://fin.land.naver.com/articles/{article}"
 
     def normalize_article_payload(*args: Any, **kwargs: Any) -> dict[str, Any]:
         _raise_missing_upstream()
@@ -114,10 +131,10 @@ COMPARE_TOKENS = ["비교", "대비", "vs", "VS"]
 LOCATION_SUFFIXES = ("특별시", "광역시", "시", "도", "군", "구", "동", "읍", "면", "리", "가")
 SIMPLE_KOREAN_TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
 RAW_COMPLEX_ID_RE = re.compile(r"(?:complex(?:\s*id|no)?|단지(?:\s*id)?|id)\s*[:=#-]?\s*(\d{3,10})", re.I)
-WATCH_STATE_FILE = WORKSPACE / "skills" / "naver-real-estate-search" / "data" / "watch-rules.json"
-CANDIDATE_CACHE_FILE = WORKSPACE / "skills" / "naver-real-estate-search" / "data" / "candidate-cache.json"
-DEFAULT_CANDIDATE_SEED_FILE = WORKSPACE / "skills" / "naver-real-estate-search" / "references" / "candidate-seeds.json"
-DEFAULT_SEED_INPUT_FILE = WORKSPACE / "skills" / "naver-real-estate-search" / "references" / "seoul-major-complexes.seed-input.json"
+WATCH_STATE_FILE = SKILL_ROOT / "data" / "watch-rules.json"
+CANDIDATE_CACHE_FILE = SKILL_ROOT / "data" / "candidate-cache.json"
+DEFAULT_CANDIDATE_SEED_FILE = SKILL_ROOT / "references" / "candidate-seeds.json"
+DEFAULT_SEED_INPUT_FILE = SKILL_ROOT / "references" / "seoul-major-complexes.seed-input.json"
 APT_SUFFIX_RE = re.compile(r"(?:아파트|맨션|타운하우스|주상복합|오피스텔|빌라)$")
 AREA_RANGE_RE = re.compile(r"(\d{1,2})\s*평\s*[~-]\s*(\d{1,2})\s*평")
 AREA_BAND_RE = re.compile(r"(\d{1,2})\s*평대")
@@ -438,10 +455,14 @@ def split_candidate_keywords(query: str) -> list[str]:
 def extract_direct_complex_ids(text: str) -> list[str]:
     direct_complex_ids: list[str] = []
     seen: set[str] = set()
-    for _, cid in NaverURLParser.extract_from_text(text or ""):
+    for entry in NaverURLParser.extract_from_text(text or ""):
+        # naverland-scrapper vNext returns structured dictionaries; older
+        # releases returned ``(name, complex_id)`` tuples.
+        cid = entry.get("complex_id") if isinstance(entry, dict) else (entry[1] if len(entry) > 1 else "")
         if cid and cid not in seen:
-            direct_complex_ids.append(cid)
-            seen.add(cid)
+            normalized = str(cid)
+            direct_complex_ids.append(normalized)
+            seen.add(normalized)
     for match in RAW_COMPLEX_ID_RE.finditer(text or ""):
         cid = match.group(1)
         if cid and cid not in seen:
@@ -457,13 +478,15 @@ def build_direct_lookup_payload(query: str | None, complex_id: str | None, url: 
     parts = [str(x or "") for x in [query, complex_id, url] if str(x or "").strip()]
     direct_ids = extract_direct_complex_ids("\n".join(parts))
     chosen = str(complex_id or "").strip() or (NaverURLParser.extract_complex_id(url) if url else None) or (direct_ids[0] if direct_ids else None)
+    asset_type = "VL" if "/houses/" in str(url or "").lower() else "APT"
     return {
         "query": query,
         "explicit_complex_id": complex_id,
         "explicit_url": url,
         "detected_complex_ids": direct_ids,
         "selected_complex_id": chosen,
-        "canonical_complex_url": f"https://new.land.naver.com/complexes/{chosen}" if chosen else None,
+        "asset_type": asset_type,
+        "canonical_complex_url": build_complex_url(chosen, asset_type=asset_type) if chosen else None,
     }
 
 
@@ -521,7 +544,7 @@ def fetch_complex_info(complex_id: str) -> dict[str, Any]:
             "name": str(info.get("complexName") or info.get("complexNm") or f"단지_{complex_id}"),
             "address": address,
             "household_count": info.get("totalHouseHoldCount") or info.get("houseHoldCount"),
-            "complex_url": f"https://new.land.naver.com/complexes/{complex_id}",
+            "complex_url": build_complex_url(complex_id),
         }
         remember_candidate(result)
         return result
@@ -873,7 +896,7 @@ def search_complex_candidates(query: str, *, candidate_limit: int = 5) -> list[d
         except Exception as exc:
             info = {"complex_id": cid, "name": f"단지_{cid}", "address": "", "error": str(exc), "source": "web-search-fallback"}
         score = _score_candidate(info, source_term, parsed)
-        merged[cid] = {**info, "match_score": score, "source_term": source_term, "source": info.get("source") or "web-search", "complex_url": f"https://new.land.naver.com/complexes/{cid}"}
+        merged[cid] = {**info, "match_score": score, "source_term": source_term, "source": info.get("source") or "web-search", "complex_url": info.get("complex_url") or build_complex_url(cid)}
 
     scored = list(merged.values())
     scored.sort(key=lambda row: (-int(row.get("match_score") or 0), str(row.get("name") or ""), str(row.get("complex_id") or "")))
@@ -1121,7 +1144,7 @@ def run_query(*, query: str | None, complex_id: str | None, url: str | None, tra
 def run_self_test() -> int:
     if not UPSTREAM.exists() or UPSTREAM_IMPORT_ERROR is not None:
         print(
-            "SKIP: upstream clone(tmp/naverland-scrapper) 미구성 상태라 upstream 의존 self-test는 건너뜁니다.",
+            f"SKIP: upstream clone을 찾지 못했습니다 ({UPSTREAM}). NAVERLAND_SCRAPPER_PATH 또는 sibling/tmp checkout을 확인하세요.",
             file=sys.stderr,
         )
         return 0
@@ -1168,7 +1191,8 @@ def run_self_test() -> int:
     assert list_candidate_cache(limit=5, keyword="리센츠")
     ref_candidates = search_reference_candidates("서울 양천구 신월동 신월시영아파트 전세", candidate_limit=3)
     assert ref_candidates and normalize_complex_alias(ref_candidates[0]["name"]) == "신월시영"
-    _write_candidate_cache(backup_cache)
+    # A self-test must not mutate the user's cache timestamp.
+    _write_json_file(CANDIDATE_CACHE_FILE, backup_cache)
 
     score = _score_candidate({"name": "잠실리센츠", "address": "서울시 송파구 잠실동", "household_count": 5563}, "리센츠", parsed)
     assert score > 0

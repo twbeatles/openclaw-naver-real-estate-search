@@ -1,6 +1,8 @@
-# naver-real-estate-search
+# openclaw-naver-real-estate-search
 
-네이버 부동산 기반으로 대한민국 아파트/빌라/오피스텔 매물 조회, 단지 후보 탐색, 비교 브리핑, 가격 감시를 수행하는 OpenClaw 스킬입니다.
+OpenClaw용 네이버 부동산 스킬입니다. 대한민국 아파트/빌라/오피스텔 매물 조회, 단지 후보 탐색, 비교 브리핑, 가격 감시를 수행합니다.
+
+`naverland-scrapper` checkout은 `NAVERLAND_SCRAPPER_PATH` 환경 변수, workspace의 `tmp/naverland-scrapper`, 또는 이 리포와 같은 상위 폴더의 sibling checkout 순으로 자동 탐색합니다. 따라서 이 리포를 `D:\twbeatles-repos\openclaw-naver-real-estate-search`로 두면 `D:\twbeatles-repos\naverland-scrapper`를 바로 사용합니다.
 
 ## 주요 개선점
 - alias/후보 캐시 구조 강화 (`candidate-cache.json` v3 스타일)

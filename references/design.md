@@ -1,4 +1,4 @@
-# naver-real-estate-search 설계 메모
+# openclaw-naver-real-estate-search 설계 메모
 
 ## 목표
 - 대한민국 / 네이버 부동산 맥락에 맞는 OpenClaw 스킬 제공

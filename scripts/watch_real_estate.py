@@ -33,6 +33,17 @@ def _fmt_price(value: int | None) -> str:
     return PriceConverter.to_string(value) if value else "-"
 
 
+def _target_price_to_manwon(value: int | float | None) -> int | None:
+    """Accept documented won input while preserving legacy 만원 rules."""
+    if value is None:
+        return None
+    try:
+        amount = int(value)
+    except (TypeError, ValueError):
+        return None
+    return amount // 10_000 if amount >= 10_000_000 else amount
+
+
 def _article_key(item: dict[str, Any]) -> str:
     return str(item.get("article_key") or f"{item.get('complex_id', '')}:{item.get('매물ID', '')}")
 
@@ -45,7 +56,8 @@ def _normalize_rule(args: argparse.Namespace) -> dict[str, Any]:
         "complex_id": args.complex_id,
         "url": args.url,
         "trade_types": [token.strip() for token in str(args.trade_types or "").split(",") if token.strip()],
-        "target_max_price": args.target_max_price,
+        "target_max_price": _target_price_to_manwon(args.target_max_price),
+        "target_max_price_won": args.target_max_price if args.target_max_price and args.target_max_price >= 10_000_000 else None,
         "pages": args.pages,
         "limit": args.limit,
         "candidate_limit": args.candidate_limit,
@@ -91,6 +103,7 @@ def _make_match(rule: dict[str, Any], item: dict[str, Any], *, event_type: str, 
         "previous_price": previous.get("price") if previous else None,
         "previous_price_text": _fmt_price(previous.get("price")) if previous and previous.get("price") else None,
         "target_max_price": rule.get("target_max_price"),
+        "target_max_price_won": (rule.get("target_max_price") or 0) * 10_000,
         "target_max_price_text": _fmt_price(rule.get("target_max_price")),
         "detected_at": int(time.time()),
     }
@@ -183,7 +196,7 @@ def check_rules(args: argparse.Namespace) -> int:
                 "snapshot": None,
             })
             continue
-        threshold = rule.get("target_max_price")
+        threshold = _target_price_to_manwon(rule.get("target_max_price"))
         matches = []
         for item in payload.get("items", []):
             price = PriceConverter.to_int(item.get("매매가") or item.get("보증금") or "0")

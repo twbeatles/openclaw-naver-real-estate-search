@@ -1,9 +1,9 @@
 ---
-name: naver-real-estate-search
-description: Search, compare, and monitor 대한민국 property listings from 네이버 부동산 with natural-language queries. Use when the user wants 강남 아파트 전세 시세 찾기, 특정 지역 매매/전세/월세 비교, 조건에 맞는 매물 리스트 정리, 단지 후보 찾기, 여러 단지 비교 리포트, 자연어 채팅형 부동산 브리핑, or 목표가/새 매물/가격하락 감시 초안. Supports Korean property tasks such as apartment/빌라 listing summaries, 지역명/단지명 기반 단지 후보 탐색, same-area comparison, candidate seed/candidate cache workflows, and stdout/JSON results that can be connected to Telegram or higher-level briefings. Prefer direct 단지 URL or complex ID first when rate-limited; otherwise use the natural-language wrapper and narrow to 1~3 candidate complexes before broad scans.
+name: openclaw-naver-real-estate-search
+description: OpenClaw skill to search, compare, and monitor 대한민국 property listings from 네이버 부동산 with natural-language queries. Use when the user wants 강남 아파트 전세 시세 찾기, 특정 지역 매매/전세/월세 비교, 조건에 맞는 매물 리스트 정리, 단지 후보 찾기, 여러 단지 비교 리포트, 자연어 채팅형 부동산 브리핑, or 목표가/새 매물/가격하락 감시 초안. Supports Korean property tasks such as apartment/빌라 listing summaries, 지역명/단지명 기반 단지 후보 탐색, same-area comparison, candidate seed/candidate cache workflows, and stdout/JSON results that can be connected to Telegram or higher-level briefings. Prefer direct 단지 URL or complex ID first when rate-limited; otherwise use the natural-language wrapper and narrow to 1~3 candidate complexes before broad scans.
 ---
 
-# Naver Real Estate Search
+# OpenClaw Naver Real Estate Search
 
 네이버 부동산 기반의 **대한민국 부동산 매물 검색 / 단지 후보 탐색 / 단지 비교 / 채팅형 브리핑 / 가격 감시** 스킬이다.
 
@@ -17,9 +17,9 @@ description: Search, compare, and monitor 대한민국 property listings from �
 
 ## Source dependency
 
-이 스킬은 로컬 upstream clone을 래핑한다.
+이 스킬은 로컬 `naverland-scrapper` checkout을 선택적으로 래핑한다. 탐색 순서는 `NAVERLAND_SCRAPPER_PATH`, workspace의 `tmp/naverland-scrapper`, 같은 리포 컬렉션의 sibling checkout이다.
 
-- `tmp/naverland-scrapper`
+- 예: `D:\twbeatles-repos\naverland-scrapper`
 
 재사용하는 주요 로직:
 - `src.core.parser.NaverURLParser`

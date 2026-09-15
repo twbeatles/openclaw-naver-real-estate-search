@@ -8,8 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-WORKSPACE = Path(__file__).resolve().parents[3]
-UPSTREAM = WORKSPACE / "tmp" / "naverland-scrapper"
+from runtime_paths import SKILL_ROOT, UPSTREAM, WORKSPACE
+
 SRC_ROOT = UPSTREAM / "src"
 if str(UPSTREAM) not in sys.path:
     sys.path.insert(0, str(UPSTREAM))
@@ -19,7 +19,7 @@ if str(SRC_ROOT) not in sys.path:
 UPSTREAM_IMPORT_ERROR: Exception | None = None
 try:
     from src.core.parser import NaverURLParser
-    from src.utils.helpers import PriceConverter, get_article_url
+    from src.utils.helpers import PriceConverter, build_complex_url, get_article_url
     from src.utils.runtime_playwright import configure_playwright_browsers_path
 except Exception as exc:
     UPSTREAM_IMPORT_ERROR = exc
@@ -44,10 +44,23 @@ except Exception as exc:
             raw = str(value or "").strip()
             if not raw:
                 return 0
-            digits = re.sub(r"[^0-9]", "", raw)
-            return int(digits) if digits else 0
+            raw = raw.replace(",", "").replace(" ", "")
+            if "억" in raw:
+                head, _, tail = raw.partition("억")
+                try:
+                    return int(float(head)) * 10000 + int(float(tail.replace("만", "") or 0))
+                except ValueError:
+                    return 0
+            try:
+                return int(float(raw.replace("만", "")))
+            except ValueError:
+                return 0
 
-    def get_article_url(complex_id: str, article_id: str, real_estate_type: str = "APT") -> str:
+    def build_complex_url(complex_id: str, *, asset_type: str = "APT", preferred_family: str = "new") -> str:
+        path = "houses" if str(asset_type).upper() == "VL" else "complexes"
+        return f"https://new.land.naver.com/{path}/{complex_id}" if str(complex_id).strip() else ""
+
+    def get_article_url(complex_id: str, article_id: str, asset_type: str = "APT") -> str:
         article = str(article_id or "").strip()
         if not article:
             return ""
@@ -58,8 +71,8 @@ except Exception as exc:
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-DEFAULT_PROFILE_DIR = WORKSPACE / "playwright_profile" / "naver-real-estate-search"
-DEFAULT_STORAGE_STATE = WORKSPACE / "skills" / "naver-real-estate-search" / "data" / "browser-session.json"
+DEFAULT_PROFILE_DIR = WORKSPACE / "playwright_profile" / "openclaw-naver-real-estate-search"
+DEFAULT_STORAGE_STATE = SKILL_ROOT / "data" / "browser-session.json"
 DEFAULT_HOME_URL = "https://new.land.naver.com/"
 COMPLEX_DETAIL_URL = "https://new.land.naver.com/api/complexes/{complex_id}?sameAddressGroup=false"
 COMPLEX_ARTICLE_URL = (
@@ -78,10 +91,14 @@ URL_COMPLEX_ID_RE = re.compile(r"new\.land\.naver\.com/(?:complexes|houses)/(\d+
 def extract_complex_ids(text: str) -> list[str]:
     ids: list[str] = []
     seen: set[str] = set()
-    for _, cid in NaverURLParser.extract_from_text(text or ""):
+    for entry in NaverURLParser.extract_from_text(text or ""):
+        # Support both upstream contracts: current structured entries and the
+        # legacy ``(name, complex_id)`` tuple used by early releases.
+        cid = entry.get("complex_id") if isinstance(entry, dict) else (entry[1] if len(entry) > 1 else "")
         if cid and cid not in seen:
-            ids.append(cid)
-            seen.add(cid)
+            normalized = str(cid)
+            ids.append(normalized)
+            seen.add(normalized)
     for match in RAW_COMPLEX_ID_RE.finditer(text or ""):
         cid = match.group(1)
         if cid and cid not in seen:
@@ -99,7 +116,7 @@ def extract_complex_ids(text: str) -> list[str]:
 
 
 def canonical_complex_url(complex_id: str) -> str:
-    return f"https://new.land.naver.com/complexes/{complex_id}"
+    return build_complex_url(complex_id)
 
 
 def _launch_context(profile_dir: Path, *, headless: bool):
@@ -237,13 +254,15 @@ def resolve_direct_input(text: str | None, complex_id: str | None, url: str | No
     merged = "\n".join(parts)
     ids = extract_complex_ids(merged)
     chosen = str(complex_id or "").strip() or (ids[0] if ids else "")
+    asset_type = "VL" if "/houses/" in str(url or text or "").lower() else "APT"
     return {
         "input": text,
         "explicit_complex_id": complex_id,
         "explicit_url": url,
         "detected_complex_ids": ids,
         "selected_complex_id": chosen or None,
-        "canonical_complex_url": canonical_complex_url(chosen) if chosen else None,
+        "asset_type": asset_type,
+        "canonical_complex_url": build_complex_url(chosen, asset_type=asset_type) if chosen else None,
     }
 
 
