@@ -7,4 +7,5 @@ scripts/__pycache__/
 data/browser-session.json
 data/*.session.json
 data/*.log
+.codegraph/
 
