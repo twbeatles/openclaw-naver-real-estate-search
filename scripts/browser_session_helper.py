@@ -19,8 +19,8 @@ if str(SRC_ROOT) not in sys.path:
 UPSTREAM_IMPORT_ERROR: Exception | None = None
 try:
     from src.core.parser import NaverURLParser
-    from src.utils.helpers import PriceConverter, build_complex_url, get_article_url
-    from src.utils.runtime_playwright import configure_playwright_browsers_path
+    from src.utils.helpers import PriceConverter, build_complex_url, get_article_url  # pyright: ignore[reportAssignmentType]  # intentional upstream-missing fallback
+    from src.utils.runtime_playwright import configure_playwright_browsers_path  # pyright: ignore[reportAssignmentType]  # intentional upstream-missing fallback
 except Exception as exc:
     UPSTREAM_IMPORT_ERROR = exc
 
@@ -64,7 +64,7 @@ except Exception as exc:
         article = str(article_id or "").strip()
         if not article:
             return ""
-        return f"https://new.land.naver.com/articles/{article}?complexNo={complex_id}&realEstateType={real_estate_type}"
+        return f"https://new.land.naver.com/articles/{article}?complexNo={complex_id}&realEstateType={asset_type}"
 
     def configure_playwright_browsers_path() -> None:
         return None

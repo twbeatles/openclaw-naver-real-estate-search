@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from runtime_paths import SKILL_ROOT, UPSTREAM, WORKSPACE
 SRC_ROOT = UPSTREAM / "src"
@@ -25,7 +25,7 @@ UPSTREAM_IMPORT_ERROR: Exception | None = None
 try:
     from src.core.parser import NaverURLParser
     from src.core.services.response_capture import normalize_article_payload
-    from src.utils.helpers import PriceConverter, build_complex_url, get_article_url
+    from src.utils.helpers import PriceConverter, build_complex_url, get_article_url  # pyright: ignore[reportAssignmentType]  # intentional upstream-missing fallback
 except Exception as exc:
     UPSTREAM_IMPORT_ERROR = exc
 
@@ -96,7 +96,7 @@ except Exception as exc:
         _raise_missing_upstream()
 
 
-def _raise_missing_upstream() -> None:
+def _raise_missing_upstream() -> NoReturn:
     detail = f" ({UPSTREAM_IMPORT_ERROR})" if UPSTREAM_IMPORT_ERROR else ""
     raise RuntimeError(
         "필수 upstream clone(tmp/naverland-scrapper)이 없거나 불완전합니다. "
