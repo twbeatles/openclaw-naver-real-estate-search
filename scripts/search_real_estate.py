@@ -8,15 +8,13 @@ import statistics
 import sys
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from runtime_paths import SKILL_ROOT, UPSTREAM, WORKSPACE
-
-BROWSER_FALLBACK_IMPORT_ERROR: Exception | None = None
-
 SRC_ROOT = UPSTREAM / "src"
 if str(UPSTREAM) not in sys.path:
     sys.path.insert(0, str(UPSTREAM))
@@ -1302,7 +1300,7 @@ def main() -> int:
         if not args.query:
             raise SystemExit("--list-candidates 는 --query 와 함께 사용하세요.")
         candidates = search_complex_candidates(args.query, candidate_limit=max(1, args.candidate_limit))
-        print(json.dumps({"query": args.query, "parsed": asdict(parsed), "candidates": candidates, "meta": {"rate_limited": RATE_LIMIT_STATE.get('active'), "rate_limit_message": RATE_LIMIT_STATE.get('last_error')}}, ensure_ascii=False, indent=2))
+        print(json.dumps({"query": args.query, "parsed": asdict(parsed) if parsed else None, "candidates": candidates, "meta": {"rate_limited": RATE_LIMIT_STATE.get('active'), "rate_limit_message": RATE_LIMIT_STATE.get('last_error')}}, ensure_ascii=False, indent=2))
         return 0
 
     output = run_query(

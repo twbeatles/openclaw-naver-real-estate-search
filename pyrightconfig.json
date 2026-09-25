@@ -1,0 +1,14 @@
+{
+  "include": ["scripts"],
+  "exclude": ["**/__pycache__", ".git", "data"],
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Windows",
+  "typeCheckingMode": "standard",
+  "reportMissingTypeStubs": "none",
+  "executionEnvironments": [
+    {
+      "root": "scripts",
+      "extraPaths": ["scripts", "../naverland-scrapper"]
+    }
+  ]
+}
