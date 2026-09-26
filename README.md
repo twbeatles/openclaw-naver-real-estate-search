@@ -120,14 +120,14 @@ pip install playwright
 playwright install chromium
 ```
 
-### 3. 상위 `naverland-scrapper` 의존성 해결 (선택 사항)
-본 스킬은 로컬 `naverland-scrapper`의 코어 파서 및 가격 변환기를 선택적으로 활용합니다.
-`scripts/runtime_paths.py`가 다음 우선순위로 자동 탐색합니다:
+### 3. 수집 알고리즘 (내장 `naver_collect`, upstream 선택 사항)
+수집 알고리즘은 `scripts/naver_collect/`에 내장되어 단독 실행됩니다. `naverland-scrapper`의 실측 계약(`site_contract`, `article_api`, `response_capture`, 재시도/역조회 로직)을 포팅한 것으로, 별도 checkout 없이 동작합니다.
+로컬 `naverland-scrapper`가 있으면 `NaverURLParser` 이름 조회 등 일부 보조 기능에만 사용되며, `scripts/runtime_paths.py`가 다음 우선순위로 자동 탐색합니다:
 1. 환경 변수: `NAVERLAND_SCRAPPER_PATH`
 2. 워크스페이스 임시 폴더: `tmp/naverland-scrapper`
 3. 상위 형제 폴더: `../naverland-scrapper` (예: `D:\twbeatles-repos\naverland-scrapper`)
 
-> **안내**: 로컬 `naverland-scrapper`가 없더라도 자체 내장된 fallback 정규식 파서 및 포맷터(`PriceConverter`, `NaverURLParser`, `build_complex_url`)가 동작하여 단독 실행이 가능합니다.
+> **안내**: 로컬 `naverland-scrapper`가 없어도 내장 `naver_collect` 모듈(가격 변환기, 매물 정규화, 페이지네이션, 매물→단지 역조회 포함)이 동작하여 단독 실행이 가능합니다.
 
 ---
 
@@ -194,6 +194,9 @@ python scripts/search_real_estate.py [OPTIONS]
 | `--compare` | 검색된 후보 단지 간 시세 및 동일 평형 갭 비교 분석 수행 | `--query "은마 래미안대치팰리스" --compare` |
 | `--list-candidates` | 매물 상세를 조회하지 않고 단지 후보 목록만 탐색하여 출력 | `--query "신월시영아파트" --list-candidates` |
 | `--resolve-direct` | 입력 질의/URL에서 단지 ID와 canonical URL만 신속 추출 | `--query "complex 1147" --resolve-direct` |
+| `--resolve-article <ID/URL>` | 매물 ID/URL에서 단지 ID를 역조회 | `--resolve-article 27654321` |
+| `--asset-type <APT\|VL>` | 자산 유형 직접 지정 (미지정 시 URL에서 추론, 기본 APT) | `--complex-id 9999 --asset-type VL` |
+| `--include-pre` | 분양권(PRE)을 포함한 `realEstateType`으로 조회 | `--complex-id 1147 --include-pre` |
 | `--lookup-complex` | 매물 목록을 생략하고 단지 기본 정보(세대수, 주소 등)만 조회 | `--complex-id 1147 --lookup-complex` |
 | `--parse-only` | 자연어 질의 파싱 결과만 JSON으로 출력 | `--query "반포자이 20평대 전세" --parse-only` |
 | `--show-cache` | 현재 로컬 `candidate-cache.json`에 저장된 단지 조회 | `--show-cache --query "리센츠"` |

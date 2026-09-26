@@ -16,10 +16,13 @@ if str(UPSTREAM) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from naver_collect.article_api import article_api_has_more_pages, build_article_api_url
+from naver_collect.converters import PriceConverter
+from naver_collect.site_contract import build_complex_url, get_article_url
+
 UPSTREAM_IMPORT_ERROR: Exception | None = None
 try:
     from src.core.parser import NaverURLParser
-    from src.utils.helpers import PriceConverter, build_complex_url, get_article_url  # pyright: ignore[reportAssignmentType]  # intentional upstream-missing fallback
     from src.utils.runtime_playwright import configure_playwright_browsers_path  # pyright: ignore[reportAssignmentType]  # intentional upstream-missing fallback
 except Exception as exc:
     UPSTREAM_IMPORT_ERROR = exc
@@ -37,34 +40,6 @@ except Exception as exc:
                 if cid:
                     pairs.append(("", cid))
             return pairs
-
-    class PriceConverter:
-        @staticmethod
-        def to_int(value: Any) -> int:
-            raw = str(value or "").strip()
-            if not raw:
-                return 0
-            raw = raw.replace(",", "").replace(" ", "")
-            if "억" in raw:
-                head, _, tail = raw.partition("억")
-                try:
-                    return int(float(head)) * 10000 + int(float(tail.replace("만", "") or 0))
-                except ValueError:
-                    return 0
-            try:
-                return int(float(raw.replace("만", "")))
-            except ValueError:
-                return 0
-
-    def build_complex_url(complex_id: str, *, asset_type: str = "APT", preferred_family: str = "new") -> str:
-        path = "houses" if str(asset_type).upper() == "VL" else "complexes"
-        return f"https://new.land.naver.com/{path}/{complex_id}" if str(complex_id).strip() else ""
-
-    def get_article_url(complex_id: str, article_id: str, asset_type: str = "APT") -> str:
-        article = str(article_id or "").strip()
-        if not article:
-            return ""
-        return f"https://new.land.naver.com/articles/{article}?complexNo={complex_id}&realEstateType={asset_type}"
 
     def configure_playwright_browsers_path() -> None:
         return None
@@ -202,36 +177,48 @@ def browser_fetch(*, complex_id: str, profile_dir: Path, headless: bool, trade_t
         return {"ok": result.get("ok"), "status": result.get("status"), "body": parsed}
 
     detail = _fetch_json(COMPLEX_DETAIL_URL.format(complex_id=complex_id))
-    trade_codes = ":".join(TRADE_CODE_MAP[t] for t in trade_types if t in TRADE_CODE_MAP) or "A1:B1:B2"
+
+    wanted_trades = [t for t in (trade_types or []) if t in TRADE_CODE_MAP] or ["전세"]
     articles: list[dict[str, Any]] = []
     article_statuses: list[dict[str, Any]] = []
-    for page_no in range(1, max(1, page_count) + 1):
-        article_url = COMPLEX_ARTICLE_URL.format(complex_id=complex_id, trade_codes=trade_codes, page=page_no)
-        fetched = _fetch_json(article_url)
-        article_statuses.append({"page": page_no, "status": fetched.get("status"), "ok": fetched.get("ok")})
-        body = fetched.get("body") or {}
-        raw_list = body.get("articleList") or body.get("list") or []
-        if not raw_list:
-            continue
-        for row in raw_list[:20]:
-            price = row.get("dealOrWarrantPrc") or row.get("price") or row.get("formattedPrice") or "-"
-            monthly = row.get("rentPrc") or row.get("rentPrice") or ""
-            area = row.get("area1") or row.get("area2") or row.get("spc1") or row.get("spc2")
-            article_no = str(row.get("articleNo") or row.get("atclNo") or "")
-            asset_type = str(row.get("realEstateTypeCode") or row.get("rletTpCd") or "APT")
-            articles.append(
-                {
-                    "article_no": article_no,
-                    "trade_type": row.get("tradeTypeName") or row.get("tradTpNm"),
-                    "price_text": price,
-                    "price_int": PriceConverter.to_int(str(price or "0")),
-                    "monthly_rent": monthly,
-                    "area": area,
-                    "floor_info": row.get("floorInfo"),
-                    "direction": row.get("direction"),
-                    "article_url": get_article_url(complex_id, article_no, asset_type) if article_no else None,
-                }
+    seen_article_nos: set[str] = set()
+    for trade_type in wanted_trades:
+        for page_no in range(1, max(1, page_count) + 1):
+            article_url = build_article_api_url("complexes", complex_id, trade_type, "APT", page=page_no)
+            fetched = _fetch_json(article_url)
+            article_statuses.append(
+                {"trade_type": trade_type, "page": page_no, "status": fetched.get("status"), "ok": fetched.get("ok")}
             )
+            body = fetched.get("body") or {}
+            raw_list = body.get("articleList") or body.get("articles") or body.get("list") or []
+            if not raw_list:
+                break
+            for row in raw_list[:20]:
+                article_no = str(row.get("articleNo") or row.get("atclNo") or "")
+                if not article_no or article_no in seen_article_nos:
+                    continue
+                seen_article_nos.add(article_no)
+                price = row.get("dealOrWarrantPrc") or row.get("price") or row.get("formattedPrice") or "-"
+                monthly = row.get("rentPrc") or row.get("rentPrice") or ""
+                area = row.get("area1") or row.get("area2") or row.get("spc1") or row.get("spc2")
+                asset_type = str(row.get("realEstateTypeCode") or row.get("rletTpCd") or "APT")
+                articles.append(
+                    {
+                        "article_no": article_no,
+                        "trade_type": row.get("tradeTypeName") or row.get("tradTpNm") or trade_type,
+                        "price_text": price,
+                        "price_int": PriceConverter.to_int(str(price or "0")),
+                        "monthly_rent": monthly,
+                        "area": area,
+                        "floor_info": row.get("floorInfo"),
+                        "direction": row.get("direction"),
+                        "asset_type": asset_type,
+                        "realtor_name": row.get("realtorName") or row.get("realtorNm") or "",
+                        "article_url": get_article_url(complex_id, article_no, asset_type) if article_no else None,
+                    }
+                )
+            if isinstance(body, dict) and not article_api_has_more_pages(body, len(raw_list)):
+                break
     payload = {
         "kind": "browser-assisted-fetch",
         "captured_at": int(time.time()),

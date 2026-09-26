@@ -21,11 +21,20 @@ if str(UPSTREAM) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from naver_collect.article_api import (
+    MAX_ARTICLE_API_PAGES,
+    article_api_has_more_pages,
+    article_api_list_count,
+    build_article_api_url,
+)
+from naver_collect.article_lookup import resolve_article_complex
+from naver_collect.converters import AreaConverter, PriceConverter
+from naver_collect.response_capture import detect_trade_type, normalize_article_payload
+from naver_collect.site_contract import build_complex_overview_url, build_complex_url, get_article_url
+
 UPSTREAM_IMPORT_ERROR: Exception | None = None
 try:
     from src.core.parser import NaverURLParser
-    from src.core.services.response_capture import normalize_article_payload
-    from src.utils.helpers import PriceConverter, build_complex_url, get_article_url  # pyright: ignore[reportAssignmentType]  # intentional upstream-missing fallback
 except Exception as exc:
     UPSTREAM_IMPORT_ERROR = exc
 
@@ -46,62 +55,12 @@ except Exception as exc:
         def fetch_complex_name(complex_id: str) -> str:
             _raise_missing_upstream()
 
-    class PriceConverter:
-        @staticmethod
-        def to_int(value: Any) -> int:
-            raw = str(value or "").replace(",", "").replace(" ", "").strip()
-            if not raw:
-                return 0
-            if "억" in raw:
-                head, _, tail = raw.partition("억")
-                try:
-                    eok = int(float(head)) * 10000
-                except ValueError:
-                    eok = 0
-                try:
-                    man = int(float(tail.replace("만", "").strip() or 0))
-                except ValueError:
-                    man = 0
-                return eok + man
-            try:
-                return int(float(raw.replace("만", "")))
-            except ValueError:
-                return 0
-
-        @staticmethod
-        def to_string(value: Any) -> str:
-            amount = PriceConverter.to_int(value)
-            if amount <= 0:
-                return "0"
-            eok = amount // 10000
-            man = amount % 10000
-            if eok and man:
-                return f"{eok}억 {man:,}만"
-            if eok:
-                return f"{eok}억"
-            return f"{man:,}만"
-
-    def build_complex_url(complex_id: str, *, asset_type: str = "APT", preferred_family: str = "new") -> str:
-        path = "houses" if str(asset_type).upper() == "VL" else "complexes"
-        host = "m.land.naver.com" if preferred_family == "m" else "new.land.naver.com"
-        return f"https://{host}/{path}/{complex_id}" if str(complex_id).strip() else ""
-
-    def get_article_url(complex_id: str, article_id: str, asset_type: str = "APT") -> str:
-        article = str(article_id or "").strip()
-        if not article:
-            return ""
-        return f"https://fin.land.naver.com/articles/{article}"
-
-    def normalize_article_payload(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        _raise_missing_upstream()
-
-
 def _raise_missing_upstream() -> NoReturn:
     detail = f" ({UPSTREAM_IMPORT_ERROR})" if UPSTREAM_IMPORT_ERROR else ""
     raise RuntimeError(
-        "필수 upstream clone(tmp/naverland-scrapper)이 없거나 불완전합니다. "
-        "이 스킬은 해당 로컬 저장소의 src 패키지에 의존합니다. "
-        f"경로를 확인한 뒤 다시 시도해 주세요{detail}"
+        "선택적 upstream checkout(tmp/naverland-scrapper)이 없거나 불완전합니다. "
+        "기본 수집은 내장 naver_collect 모듈로 동작합니다. "
+        f"upstream 기능이 필요하면 경로를 확인해 주세요{detail}"
     )
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
@@ -179,12 +138,46 @@ class ParsedQuery:
     direct_complex_ids: list[str]
 
 
-RATE_LIMIT_STATE = {"active": False, "last_error": None}
+RATE_LIMIT_STATE: dict[str, Any] = {"active": False, "last_error": None}
+ARTICLE_API_STATS: dict[str, Any] = {
+    "page_cap_truncated_count": 0,
+    "failure_reasons": {},
+    "last_status": "",
+}
+ARTICLE_API_PAGE_DELAY_SEC = 0.15
 
 
 def _record_rate_limit(message: str) -> None:
     RATE_LIMIT_STATE["active"] = True
     RATE_LIMIT_STATE["last_error"] = message
+
+
+def _record_article_api_failure(reason: str, *, status: str = "") -> None:
+    ARTICLE_API_STATS["last_status"] = str(status or reason or "unknown")
+    failures = ARTICLE_API_STATS.setdefault("failure_reasons", {})
+    key = str(reason or "unknown")
+    failures[key] = int(failures.get(key, 0)) + 1
+
+
+def _parse_retry_after(exc: urllib.error.HTTPError) -> float | None:
+    try:
+        headers = exc.headers
+        raw = headers.get("Retry-After") if headers else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, min(60.0, float(str(raw).strip())))
+    except (TypeError, ValueError):
+        return None
+
+
+def _backoff_with_jitter(base: float) -> float:
+    import random
+
+    base = max(0.1, float(base))
+    return base + random.uniform(0, base * 0.3)
 
 
 def _request_json(url: str, *, referer: str = "https://new.land.naver.com/", backoffs: list[float] | None = None) -> Any:
@@ -200,16 +193,26 @@ def _request_json(url: str, *, referer: str = "https://new.land.naver.com/", bac
                 RATE_LIMIT_STATE["active"] = False
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="ignore")
-            if exc.code == 429 and attempt < len(backoffs):
-                _record_rate_limit("429")
-                time.sleep(backoffs[attempt])
-                continue
+            try:
+                body = exc.read().decode("utf-8", errors="ignore")
+            except (OSError, ValueError, AttributeError):
+                body = ""
             if exc.code == 429:
                 _record_rate_limit("429")
+                _record_article_api_failure("rate_limited", status="429")
+                if attempt < len(backoffs):
+                    time.sleep(_parse_retry_after(exc) or _backoff_with_jitter(backoffs[attempt]))
+                    continue
                 raise SearchError(
                     "네이버 부동산 API가 429(요청 제한)를 반환했습니다. 단일 단지 URL/ID를 우선 사용하거나, 후보 단지부터 1~3개로 좁혀 다시 시도해 주세요."
                 )
+            if exc.code == 403:
+                _record_article_api_failure("forbidden", status="403")
+                raise SearchError(
+                    f"네이버 부동산 API 접근이 차단되었습니다: HTTP 403 {body[:200]}. "
+                    "브라우저 세션(fetch/capture)으로 direct URL/ID를 확보한 뒤 다시 시도해 주세요."
+                )
+            _record_article_api_failure("http_error", status=str(exc.code))
             raise SearchError(f"네이버 부동산 API 호출 실패: HTTP {exc.code} {body[:200]}")
         except Exception as exc:
             raise SearchError(f"네이버 부동산 API 호출 실패: {exc}") from exc
@@ -246,7 +249,7 @@ def _area_to_pyeong(value: Any) -> float | None:
         return None
     if number <= 0:
         return None
-    return round(number / 3.305785, 2)
+    return AreaConverter.sqm_to_pyeong(number)
 
 
 def _browser_fetch_bundle(complex_id: str, trade_types: list[str], pages: int) -> dict[str, Any]:
@@ -270,26 +273,31 @@ def _browser_fetch_bundle(complex_id: str, trade_types: list[str], pages: int) -
     }
     items: list[dict[str, Any]] = []
     for row in payload.get("articles") or []:
-        trade_type = str(row.get("trade_type") or "").strip() or "전세"
-        price_text = str(row.get("price_text") or "-")
-        price_int = PriceConverter.to_int(price_text)
-        monthly_rent = str(row.get("monthly_rent") or "").strip()
-        item = {
-            "단지명": complex_name,
-            "거래유형": trade_type,
-            "매매가": price_text if trade_type == "매매" else "",
-            "보증금": price_text if trade_type != "매매" else "",
-            "월세": monthly_rent if trade_type == "월세" else "",
-            "면적(평)": _area_to_pyeong(row.get("area")),
-            "층/방향": " / ".join([part for part in [str(row.get("floor_info") or "").strip(), str(row.get("direction") or "").strip()] if part]) or "-",
-            "특징": "browser-assisted-fetch",
-            "매물URL": row.get("article_url"),
-            "매물ID": row.get("article_no"),
-            "자산유형": "APT",
-            "complex_id": complex_id,
-            "article_key": f"{complex_id}:{row.get('article_no') or ''}",
-            "price_int": price_int,
+        raw_article = {
+            "tradeTypeName": row.get("trade_type"),
+            "dealOrWarrantPrc": row.get("price_text"),
+            "rentPrc": row.get("monthly_rent"),
+            "area1": row.get("area"),
+            "floorInfo": row.get("floor_info"),
+            "direction": row.get("direction"),
+            "articleNo": row.get("article_no"),
+            "realEstateTypeCode": row.get("asset_type") or "APT",
+            "articleFeatureDesc": "browser-assisted-fetch",
+            "realtorName": row.get("realtor_name") or "",
         }
+        requested = str(row.get("trade_type") or "").strip() or (trade_types[0] if trade_types else "전세")
+        try:
+            item = normalize_article_payload(
+                raw_article, complex_name, complex_id, requested_trade_type=requested, asset_type="APT", mode="browser"
+            )
+        except Exception:  # noqa: BLE001, S112 - skip malformed browser rows
+            continue
+        item["매물URL"] = row.get("article_url") or get_article_url(
+            complex_id, item.get("매물ID", ""), item.get("자산유형", "APT")
+        )
+        item["complex_id"] = complex_id
+        item["article_key"] = f"{complex_id}:{item.get('매물ID', '')}"
+        item["price_int"] = PriceConverter.to_int(item.get("매매가") or item.get("보증금") or "0")
         items.append(item)
     remember_candidate(info)
     return {"complex_info": info, "items": items, "raw": payload}
@@ -477,6 +485,17 @@ def build_direct_lookup_payload(query: str | None, complex_id: str | None, url: 
     direct_ids = extract_direct_complex_ids("\n".join(parts))
     chosen = str(complex_id or "").strip() or (NaverURLParser.extract_complex_id(url) if url else None) or (direct_ids[0] if direct_ids else None)
     asset_type = "VL" if "/houses/" in str(url or "").lower() else "APT"
+    article_resolution: dict[str, str] = {}
+    if not chosen:
+        for text in [str(url or ""), str(query or "")]:
+            aid_match = re.search(r"(?:articles?/|[?&]article(?:Id|No)=)(\d{5,12})", text)
+            if aid_match:
+                article_resolution = resolve_article_complex(aid_match.group(1), fallback_asset_type=asset_type)
+                if article_resolution.get("complex_id"):
+                    chosen = str(article_resolution["complex_id"])
+                    asset_type = str(article_resolution.get("asset_type") or asset_type)
+                    direct_ids = [chosen, *direct_ids]
+                break
     return {
         "query": query,
         "explicit_complex_id": complex_id,
@@ -485,6 +504,7 @@ def build_direct_lookup_payload(query: str | None, complex_id: str | None, url: 
         "selected_complex_id": chosen,
         "asset_type": asset_type,
         "canonical_complex_url": build_complex_url(chosen, asset_type=asset_type) if chosen else None,
+        "article_resolution": article_resolution,
     }
 
 
@@ -532,26 +552,65 @@ def extract_complex_candidates_from_web(query: str, limit: int = 5) -> list[dict
     return [{"complex_id": cid, "source": "web-search", "query": query} for cid in ids]
 
 
-def fetch_complex_info(complex_id: str) -> dict[str, Any]:
+def _parse_complex_detail_payload(complex_id: str, payload: Any, asset_type: str = "APT") -> dict[str, Any]:
+    info = (payload.get("complexDetail") or payload) if isinstance(payload, dict) else {}
+    if not isinstance(info, dict):
+        info = {}
+    address = " ".join(filter(None, [str(info.get("cortarAddress") or "").strip(), str(info.get("roadAddressPrefix") or "").strip()])).strip()
+    return {
+        "complex_id": complex_id,
+        "name": str(info.get("complexName") or info.get("complexNm") or info.get("houseName") or f"단지_{complex_id}"),
+        "address": address,
+        "household_count": info.get("totalHouseHoldCount") or info.get("houseHoldCount"),
+        "complex_url": build_complex_url(complex_id, asset_type=asset_type),
+        "asset_type": asset_type,
+    }
+
+
+def fetch_complex_info(complex_id: str, asset_type: str = "APT") -> dict[str, Any]:
+    last_error: Exception | None = None
+    last_result: dict[str, Any] | None = None
+    for candidate_asset in ([asset_type] if asset_type in ("APT", "VL") else ["APT", "VL"]):
+        for url in (
+            COMPLEX_DETAIL_URL.format(complex_id=complex_id),
+            build_complex_overview_url(complex_id, asset_type=candidate_asset),
+        ):
+            try:
+                payload = _request_json(url)
+                result = _parse_complex_detail_payload(complex_id, payload, asset_type=candidate_asset)
+                if str(result.get("name") or "").strip() not in ("", f"단지_{complex_id}"):
+                    remember_candidate(result)
+                    return result
+                last_result = result
+            except SearchError as exc:
+                last_error = exc
+                continue
+    if last_result is not None:
+        remember_candidate(last_result)
+        return last_result
     try:
-        payload = _request_json(COMPLEX_DETAIL_URL.format(complex_id=complex_id))
-        info = payload.get("complexDetail") or payload
-        address = " ".join(filter(None, [str(info.get("cortarAddress") or "").strip(), str(info.get("roadAddressPrefix") or "").strip()])).strip()
-        result = {
-            "complex_id": complex_id,
-            "name": str(info.get("complexName") or info.get("complexNm") or f"단지_{complex_id}"),
-            "address": address,
-            "household_count": info.get("totalHouseHoldCount") or info.get("houseHoldCount"),
-            "complex_url": build_complex_url(complex_id),
-        }
-        remember_candidate(result)
-        return result
-    except SearchError:
         browser_bundle = _browser_fetch_bundle(complex_id, ["전세"], 1)
         result = dict(browser_bundle.get("complex_info") or {})
         result["source"] = "browser-assisted-fallback"
         remember_candidate(result)
         return result
+    except Exception as exc:
+        if last_error is not None:
+            raise last_error
+        raise SearchError(f"단지 정보 조회 실패: {exc}") from exc
+
+
+def _fetch_complex_name(complex_id: str) -> str:
+    try:
+        name = str(NaverURLParser.fetch_complex_name(complex_id) or "")
+        if name:
+            return name
+    except Exception:  # noqa: BLE001, S110 - fall through to detail API
+        pass
+    try:
+        return str(fetch_complex_info(complex_id).get("name") or f"단지_{complex_id}")
+    except Exception:  # noqa: BLE001 - last-resort placeholder name
+        return f"단지_{complex_id}"
 
 
 def _tokenize_for_match(text: str) -> list[str]:
@@ -901,25 +960,122 @@ def search_complex_candidates(query: str, *, candidate_limit: int = 5) -> list[d
     return scored[:candidate_limit]
 
 
-def fetch_articles(complex_id: str, trade_types: list[str], pages: int = 1) -> list[dict[str, Any]]:
-    trade_codes = ":".join(TRADE_CODE_MAP[t] for t in trade_types if t in TRADE_CODE_MAP)
-    if not trade_codes:
-        trade_codes = "A1:B1:B2"
+def _normalize_article_page(
+    payload: Any,
+    *,
+    complex_name: str,
+    complex_id: str,
+    trade_type: str,
+    path_asset: str,
+    seen_ids: set[str],
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    article_list = payload.get("articleList") or payload.get("articles") or payload.get("list") or []
+    if not isinstance(article_list, list):
+        return []
+    raw_items: list[dict[str, Any]] = []
+    for article in article_list:
+        if not isinstance(article, dict):
+            continue
+        if detect_trade_type(article, requested_trade_type=trade_type) != trade_type:
+            continue
+        normalized = normalize_article_payload(
+            article, complex_name, complex_id, requested_trade_type=trade_type, asset_type=path_asset
+        )
+        aid = str(normalized.get("매물ID", "") or "")
+        if not aid or aid in seen_ids:
+            continue
+        seen_ids.add(aid)
+        normalized["매물URL"] = get_article_url(complex_id, aid, normalized.get("자산유형", "APT"))
+        normalized["complex_id"] = complex_id
+        normalized["article_key"] = f"{complex_id}:{aid}"
+        raw_items.append(normalized)
+    return raw_items
+
+
+def _fetch_trade_pages(
+    complex_id: str,
+    complex_name: str,
+    trade_type: str,
+    *,
+    path_asset: str = "APT",
+    base_kind: str = "complexes",
+    pages: int = 1,
+    include_pre: bool = False,
+    seen_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    seen_ids = seen_ids if seen_ids is not None else set()
+    last_page = 1
+    last_has_more = False
+    page_cap = min(max(1, int(pages or 1)), MAX_ARTICLE_API_PAGES)
+    for page in range(1, page_cap + 1):
+        last_page = page
+        if page > 1 and ARTICLE_API_PAGE_DELAY_SEC > 0:
+            time.sleep(ARTICLE_API_PAGE_DELAY_SEC)
+        api_url = build_article_api_url(
+            base_kind, complex_id, trade_type, path_asset, page=page, include_pre=include_pre
+        )
+        try:
+            payload = _request_json(api_url)
+        except SearchError as exc:
+            if page == 1 and not items:
+                raise
+            _record_article_api_failure("paged_stop", status=str(exc)[:40])
+            break
+        if not isinstance(payload, dict):
+            if page == 1 and not items:
+                _record_article_api_failure("invalid_payload", status="invalid_payload")
+            break
+        list_count = article_api_list_count(payload)
+        items.extend(
+            _normalize_article_page(
+                payload,
+                complex_name=complex_name,
+                complex_id=complex_id,
+                trade_type=trade_type,
+                path_asset=path_asset,
+                seen_ids=seen_ids,
+            )
+        )
+        last_has_more = article_api_has_more_pages(payload, list_count)
+        if not last_has_more:
+            break
+    if last_has_more and last_page >= MAX_ARTICLE_API_PAGES:
+        ARTICLE_API_STATS["page_cap_truncated_count"] = int(ARTICLE_API_STATS.get("page_cap_truncated_count", 0)) + 1
+    return items
+
+
+def fetch_articles(
+    complex_id: str,
+    trade_types: list[str],
+    pages: int = 1,
+    *,
+    asset_type: str = "APT",
+    base_kind: str = "complexes",
+    include_pre: bool = False,
+) -> list[dict[str, Any]]:
+    trade_types = [t for t in (trade_types or []) if t in TRADE_CODE_MAP] or ["전세"]
+    path_asset = asset_type if asset_type in ("APT", "VL") else "APT"
+    kind = "houses" if path_asset == "VL" else base_kind
     try:
-        complex_name = NaverURLParser.fetch_complex_name(complex_id)
+        complex_name = _fetch_complex_name(complex_id)
         items: list[dict[str, Any]] = []
-        for page in range(1, pages + 1):
-            payload = _request_json(COMPLEX_ARTICLE_URL.format(complex_id=complex_id, trade_codes=trade_codes, page=page))
-            article_list = payload.get("articleList") or payload.get("list") or []
-            if not article_list:
-                break
-            for article in article_list:
-                trade_type = str(article.get("tradeTypeName") or article.get("tradTpNm") or "").strip()
-                normalized = normalize_article_payload(article, complex_name, complex_id, requested_trade_type=trade_type)
-                normalized["매물URL"] = get_article_url(complex_id, normalized.get("매물ID", ""), normalized.get("자산유형", "APT"))
-                normalized["complex_id"] = complex_id
-                normalized["article_key"] = f"{complex_id}:{normalized.get('매물ID', '')}"
-                items.append(normalized)
+        seen_ids: set[str] = set()
+        for trade_type in trade_types:
+            items.extend(
+                _fetch_trade_pages(
+                    complex_id,
+                    complex_name,
+                    trade_type,
+                    path_asset=path_asset,
+                    base_kind=kind,
+                    pages=pages,
+                    include_pre=include_pre,
+                    seen_ids=seen_ids,
+                )
+            )
         return items
     except Exception as exc:
         browser_bundle = _browser_fetch_bundle(complex_id, trade_types, pages)
@@ -1088,13 +1244,22 @@ def summarize_comparison(results: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def run_query(*, query: str | None, complex_id: str | None, url: str | None, trade_types: list[str] | None, pages: int, limit: int, candidate_limit: int, min_pyeong: float | None, max_pyeong: float | None, compare: bool) -> dict[str, Any]:
+def _resolve_asset_type(url: str | None, explicit: str | None = None) -> str:
+    if str(explicit or "").strip().upper() in ("APT", "VL"):
+        return str(explicit or "").strip().upper()
+    if url and "/houses/" in str(url).lower():
+        return "VL"
+    return "APT"
+
+
+def run_query(*, query: str | None, complex_id: str | None, url: str | None, trade_types: list[str] | None, pages: int, limit: int, candidate_limit: int, min_pyeong: float | None, max_pyeong: float | None, compare: bool, asset_type: str | None = None, include_pre: bool = False) -> dict[str, Any]:
     parsed = parse_natural_query(query or "") if query else None
     trade_types = list(trade_types or [])
     if not trade_types:
         trade_types = parsed.trade_types if parsed else ["전세"]
     min_pyeong = min_pyeong if min_pyeong is not None else (parsed.min_pyeong if parsed else None)
     max_pyeong = max_pyeong if max_pyeong is not None else (parsed.max_pyeong if parsed else None)
+    resolved_asset = _resolve_asset_type(url, asset_type)
 
     complex_ids = resolve_complex_ids(query, complex_id, url, candidate_limit=max(1, candidate_limit))
     if not complex_ids:
@@ -1102,16 +1267,22 @@ def run_query(*, query: str | None, complex_id: str | None, url: str | None, tra
 
     compare_mode = compare or bool(parsed and parsed.compare_mode and len(complex_ids) >= 2)
     target_ids = complex_ids[: max(1, candidate_limit if compare_mode else 1)]
-    meta = {"rate_limited": bool(RATE_LIMIT_STATE.get("active")), "rate_limit_message": RATE_LIMIT_STATE.get("last_error"), "browser_fallback_used": False}
+    meta = {
+        "rate_limited": bool(RATE_LIMIT_STATE.get("active")),
+        "rate_limit_message": RATE_LIMIT_STATE.get("last_error"),
+        "browser_fallback_used": False,
+        "article_api": {key: (dict(value) if isinstance(value, dict) else value) for key, value in ARTICLE_API_STATS.items()},
+        "asset_type": resolved_asset,
+    }
 
     if compare_mode:
         results = []
         for cid in target_ids:
-            items = fetch_articles(cid, trade_types, pages=max(1, pages))
+            items = fetch_articles(cid, trade_types, pages=max(1, pages), asset_type=resolved_asset, include_pre=include_pre)
             items = filter_items(items, min_pyeong, max_pyeong, max(1, limit))
             results.append({
                 "complex_id": cid,
-                "complex_info": fetch_complex_info(cid),
+                "complex_info": fetch_complex_info(cid, asset_type=resolved_asset),
                 "trade_types": trade_types,
                 "count": len(items),
                 "market_summary": build_market_summary(items),
@@ -1121,9 +1292,9 @@ def run_query(*, query: str | None, complex_id: str | None, url: str | None, tra
         return {"query": query, "parsed": asdict(parsed) if parsed else None, "compare_mode": True, "results": results, "compare_insights": compare_insights, "meta": meta}
 
     selected_complex_id = target_ids[0]
-    items = fetch_articles(selected_complex_id, trade_types, pages=max(1, pages))
+    items = fetch_articles(selected_complex_id, trade_types, pages=max(1, pages), asset_type=resolved_asset, include_pre=include_pre)
     items = filter_items(items, min_pyeong, max_pyeong, max(1, limit))
-    complex_info = fetch_complex_info(selected_complex_id)
+    complex_info = fetch_complex_info(selected_complex_id, asset_type=resolved_asset)
     if complex_info.get("source") == "browser-assisted-fallback" or str(RATE_LIMIT_STATE.get("last_error") or "").startswith("browser-assisted-fallback"):
         meta["browser_fallback_used"] = True
     return {
@@ -1140,13 +1311,6 @@ def run_query(*, query: str | None, complex_id: str | None, url: str | None, tra
 
 
 def run_self_test() -> int:
-    if not UPSTREAM.exists() or UPSTREAM_IMPORT_ERROR is not None:
-        print(
-            f"SKIP: upstream clone을 찾지 못했습니다 ({UPSTREAM}). NAVERLAND_SCRAPPER_PATH 또는 sibling/tmp checkout을 확인하세요.",
-            file=sys.stderr,
-        )
-        return 0
-
     sample = {
         "articleNo": "123456789",
         "tradeTypeName": "전세",
@@ -1162,6 +1326,41 @@ def run_self_test() -> int:
     assert row["거래유형"] == "전세"
     assert row["보증금"] == "12억 5,000"
     assert row["면적(평)"] > 0
+    assert row["평당가"] > 0 and row["평당가_표시"].endswith("/평")
+    assert PriceConverter.to_int("1.5억") == 15000
+    assert PriceConverter.to_int("5000만") == 5000
+
+    monthly_row = normalize_article_payload(
+        {"articleNo": "1", "tradeTypeName": "월세", "dealOrWarrantPrc": "월세 5억/200", "rentPrc": "200"},
+        "테스트아파트",
+        "99999",
+        requested_trade_type="월세",
+    )
+    assert monthly_row["보증금"] == "5억" and monthly_row["월세"] == "200"
+    assert detect_trade_type({"tradeType": "B1"}) == "전세"
+
+    apt_url = build_article_api_url("complexes", "1147", "전세", "APT", page=2)
+    assert "realEstateType=APT%3AABYG%3AJGC" in apt_url and "page=2" in apt_url
+    vl_url = build_article_api_url("houses", "9999", "매매", "VL", page=1)
+    assert "realEstateType=VL%3ADDDGG%3AJWJT%3ASGJT" in vl_url
+    assert article_api_has_more_pages({"isMoreData": True}, 3) is True
+    assert article_api_has_more_pages({"articleList": [1, 2]}, 2, page_size=20) is False
+    assert article_api_list_count({"articleList": [1, 2, 3]}) == 3
+
+    dedupe_seen: set[str] = set()
+    page_items = _normalize_article_page(
+        {"articleList": [
+            {"articleNo": "11", "tradeTypeName": "전세", "dealOrWarrantPrc": "10억", "area1": 84},
+            {"articleNo": "11", "tradeTypeName": "전세", "dealOrWarrantPrc": "10억", "area1": 84},
+            {"articleNo": "12", "tradeTypeName": "매매", "dealOrWarrantPrc": "15억", "area1": 84},
+        ]},
+        complex_name="테스트아파트",
+        complex_id="99999",
+        trade_type="전세",
+        path_asset="APT",
+        seen_ids=dedupe_seen,
+    )
+    assert len(page_items) == 1 and page_items[0]["매물ID"] == "11"
 
     parsed = parse_natural_query("잠실 리센츠랑 엘스 전세 비교 30평대")
     assert parsed.compare_mode is True
@@ -1229,6 +1428,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--parse-only", action="store_true", help="자연어 파싱 결과만 출력")
     p.add_argument("--show-cache", action="store_true", help="candidate cache를 조회")
     p.add_argument("--resolve-direct", action="store_true", help="query/url/complex-id에서 direct ID와 canonical URL을 정리")
+    p.add_argument("--resolve-article", help="매물 ID/URL에서 단지 ID를 역조회 (예: 12345678 또는 fin.land URL)")
+    p.add_argument("--asset-type", choices=["APT", "VL"], default=None, help="자산 유형. 비우면 URL에서 추론하고 기본 APT")
+    p.add_argument("--include-pre", action="store_true", help="분양권(PRE)을 포함한 realEstateType으로 조회")
     p.add_argument("--lookup-complex", action="store_true", help="매물 조회 대신 단지 기본 정보만 direct lookup")
     p.add_argument("--seed-candidate-file", nargs="?", const="", help="candidate-cache에 seed할 JSON 파일 경로. 비우면 references/candidate-seeds.json")
     p.add_argument("--seed-candidate", action="store_true", help="단일 후보를 candidate-cache에 직접 저장")
@@ -1261,6 +1463,10 @@ def main() -> int:
         print(json.dumps(build_direct_lookup_payload(args.query, args.complex_id, args.url), ensure_ascii=False, indent=2))
         return 0
 
+    if args.resolve_article:
+        print(json.dumps(resolve_article_complex(args.resolve_article), ensure_ascii=False, indent=2))
+        return 0
+
     if args.seed_candidate:
         if not args.complex_id:
             raise SystemExit("--seed-candidate 는 --complex-id 와 함께 사용하세요.")
@@ -1290,7 +1496,9 @@ def main() -> int:
         selected = payload.get("selected_complex_id")
         if not selected:
             raise SystemExit("direct lookup용 complex ID를 찾지 못했습니다. --complex-id / --url / --query 중 하나에 direct 단서를 넣어 주세요.")
-        payload["complex_info"] = fetch_complex_info(str(selected))
+        payload["complex_info"] = fetch_complex_info(
+            str(selected), asset_type=_resolve_asset_type(args.url, args.asset_type or payload.get("asset_type"))
+        )
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
@@ -1314,6 +1522,8 @@ def main() -> int:
         min_pyeong=args.min_pyeong,
         max_pyeong=args.max_pyeong,
         compare=bool(args.compare),
+        asset_type=args.asset_type,
+        include_pre=bool(args.include_pre),
     )
     if args.json:
         print(json.dumps(output, ensure_ascii=False, indent=2))

@@ -17,15 +17,16 @@ description: OpenClaw skill to search, compare, and monitor 대한민국 propert
 
 ## Source dependency
 
-이 스킬은 로컬 `naverland-scrapper` checkout을 선택적으로 래핑한다. 탐색 순서는 `NAVERLAND_SCRAPPER_PATH`, workspace의 `tmp/naverland-scrapper`, 같은 리포 컬렉션의 sibling checkout이다.
+수집 알고리즘은 `scripts/naver_collect/`에 내장되어 있다 (`naverland-scrapper` 실측 계약의 포팅: `site_contract`, `article_api`, `response_capture`, 재시도/역조회 로직). 로컬 `naverland-scrapper` checkout은 `NaverURLParser` 이름 조회 같은 보조 기능에만 선택적으로 사용한다. 탐색 순서는 `NAVERLAND_SCRAPPER_PATH`, workspace의 `tmp/naverland-scrapper`, 같은 리포 컬렉션의 sibling checkout이다.
 
 - 예: `D:\twbeatles-repos\naverland-scrapper`
 
-재사용하는 주요 로직:
-- `src.core.parser.NaverURLParser`
-- `src.core.services.response_capture.normalize_article_payload`
-- `src.utils.helpers.PriceConverter`
-- `src.utils.helpers.get_article_url`
+내장 모듈이 제공하는 주요 로직:
+- `naver_collect.site_contract` (호스트 계약, `realEstateType` 매핑, fin 매물 URL)
+- `naver_collect.article_api` (페이지네이션 빌더, `isMoreData` 기반 다음페이지 판단, 50페이지 cap)
+- `naver_collect.response_capture.normalize_article_payload` (거래/자산 감지, 평당가·갭 필드)
+- `naver_collect.converters.PriceConverter` (소수 억 단위 정확 처리)
+- `naver_collect.article_lookup.resolve_article_complex` (매물→단지 역조회)
 
 ## Scripts
 
@@ -158,7 +159,10 @@ python skills/naver-real-estate-search/scripts/search_real_estate.py --show-cach
 ```bash
 python skills/naver-real-estate-search/scripts/search_real_estate.py --query "complex 1147 리센츠" --resolve-direct
 python skills/naver-real-estate-search/scripts/search_real_estate.py --url "https://new.land.naver.com/complexes/1147" --lookup-complex
+python skills/naver-real-estate-search/scripts/search_real_estate.py --resolve-article 27654321
 ```
+
+매물 URL만 있을 때는 `--resolve-article`로 단지 ID를 역조회하고, 빌라/연립은 `--asset-type VL`, 분양권 포함 조회는 `--include-pre`를 쓴다.
 
 ### 6) 단일 단지 조회
 ```bash
