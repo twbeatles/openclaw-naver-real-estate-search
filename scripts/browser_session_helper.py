@@ -17,6 +17,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from naver_collect.article_api import article_api_has_more_pages, build_article_api_url
+from naver_collect.geo_markers import build_single_markers_url, normalize_marker_row, viewport_bounds
 from naver_collect.converters import PriceConverter
 from naver_collect.site_contract import build_complex_url, get_article_url
 
@@ -141,6 +142,86 @@ def browser_capture(*, url: str | None, profile_dir: Path, storage_state_path: P
     context.close()
     pw.stop()
     return payload
+
+
+def _page_fetch_json(page: Any, api_url: str) -> dict[str, Any]:
+    script = """
+    async (apiUrl) => {
+      const res = await fetch(apiUrl, {
+        credentials: 'include',
+        headers: {
+          'accept': 'application/json, text/plain, */*',
+          'x-requested-with': 'XMLHttpRequest'
+        }
+      });
+      const text = await res.text();
+      return {ok: res.ok, status: res.status, text};
+    }
+    """
+    result = page.evaluate(script, api_url)
+    text = result.get("text") or ""
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = {"raw_text": text[:2000]}
+    return {"ok": result.get("ok"), "status": result.get("status"), "body": parsed}
+
+
+def browser_markers(*, lat: float, lon: float, zoom: int, profile_dir: Path, headless: bool, trade_types: list[str], asset_type: str = "APT", keyword: str = "") -> dict[str, Any]:
+    """Fetch single-markers in the desktop browser session and match names."""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    pw, context = _launch_context(profile_dir, headless=headless)
+    page = context.pages[0] if context.pages else context.new_page()
+    bounds = viewport_bounds(lat, lon, zoom)
+    wanted_trades = [t for t in (trade_types or []) if t in TRADE_CODE_MAP] or ["매매"]
+    keyword_norm = str(keyword or "").strip()
+    markers: list[dict[str, Any]] = []
+    statuses: list[dict[str, Any]] = []
+    try:
+        try:
+            page.goto(DEFAULT_HOME_URL, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(1500)
+        except PlaywrightTimeoutError:
+            pass
+        for trade_type in wanted_trades:
+            api_url = build_single_markers_url(
+                asset_type=asset_type, trade_type=trade_type, zoom=zoom,
+                left_lon=bounds["leftLon"], right_lon=bounds["rightLon"],
+                top_lat=bounds["topLat"], bottom_lat=bounds["bottomLat"],
+            )
+            fetched = _page_fetch_json(page, api_url)
+            statuses.append({"trade_type": trade_type, "status": fetched.get("status"), "ok": fetched.get("ok")})
+            body = fetched.get("body")
+            rows = body if isinstance(body, list) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                info = normalize_marker_row(row, asset_type=asset_type)
+                if not str(info.get("complex_id") or "").strip():
+                    continue
+                info["trade_type"] = trade_type
+                info["complex_url"] = canonical_complex_url(str(info.get("complex_id") or ""))
+                markers.append(info)
+            if markers:
+                break
+    finally:
+        context.close()
+        pw.stop()
+    matched = [row for row in markers if not keyword_norm or keyword_norm in str(row.get("name") or "")]
+    return {
+        "kind": "browser-assisted-markers",
+        "captured_at": int(time.time()),
+        "center": {"lat": lat, "lon": lon, "zoom": zoom},
+        "bounds": bounds,
+        "statuses": statuses,
+        "marker_count": len(markers),
+        "matches": matched[:20],
+        "marker_api_url": build_single_markers_url(
+            asset_type=asset_type, trade_type=wanted_trades[0], zoom=zoom,
+            left_lon=bounds["leftLon"], right_lon=bounds["rightLon"],
+            top_lat=bounds["topLat"], bottom_lat=bounds["bottomLat"],
+        ),
+    }
 
 
 def browser_fetch(*, complex_id: str, profile_dir: Path, headless: bool, trade_types: list[str], page_count: int) -> dict[str, Any]:
@@ -278,6 +359,16 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--trade-types", default="전세")
     fetch.add_argument("--pages", type=int, default=1)
 
+    markers = sub.add_parser("markers", help="브라우저 세션 안에서 same-origin single-markers를 조회한다")
+    markers.add_argument("--lat", type=float, required=True)
+    markers.add_argument("--lon", type=float, required=True)
+    markers.add_argument("--zoom", type=int, default=14)
+    markers.add_argument("--trade-types", default="매매")
+    markers.add_argument("--asset-type", default="APT")
+    markers.add_argument("--keyword", default="")
+    markers.add_argument("--profile-dir", default=str(DEFAULT_PROFILE_DIR))
+    markers.add_argument("--headless", action="store_true")
+
     return p
 
 
@@ -293,6 +384,20 @@ def main() -> int:
             storage_state_path=Path(args.storage_state),
             wait_seconds=max(0, int(args.wait_seconds)),
             headless=bool(args.headless),
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "markers":
+        trade_types = [token.strip() for token in str(args.trade_types or "").split(",") if token.strip()]
+        payload = browser_markers(
+            lat=float(args.lat),
+            lon=float(args.lon),
+            zoom=max(1, int(args.zoom)),
+            profile_dir=Path(args.profile_dir),
+            headless=bool(args.headless),
+            trade_types=trade_types or ["매매"],
+            asset_type=str(args.asset_type or "APT"),
+            keyword=str(args.keyword or ""),
         )
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0

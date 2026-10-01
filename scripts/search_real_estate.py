@@ -31,6 +31,7 @@ from naver_collect.article_lookup import resolve_article_complex
 from naver_collect.converters import AreaConverter, PriceConverter
 from naver_collect.response_capture import detect_trade_type, normalize_article_payload
 from naver_collect.site_contract import build_complex_overview_url, build_complex_url, get_article_url
+from naver_collect import geo_markers as _geo_markers
 
 UPSTREAM_IMPORT_ERROR: Exception | None = None
 try:
@@ -831,6 +832,8 @@ def search_reference_candidates(query: str, *, candidate_limit: int = 5, parsed:
                 "source_term": row.get("reference_kind") or "reference-seed",
                 "source": "reference-seed",
                 "reference_kind": row.get("reference_kind"),
+                "district": row.get("district"),
+                "neighborhood": row.get("neighborhood"),
                 "review_status": row.get("review_status"),
                 "verification_status": row.get("verification_status"),
                 "next_action": row.get("next_action"),
@@ -931,7 +934,7 @@ def search_complex_candidates(query: str, *, candidate_limit: int = 5) -> list[d
 
     for item in search_cached_candidates(query, candidate_limit=max(candidate_limit * 2, 8), parsed=parsed):
         _merge_item(item)
-    for item in search_reference_candidates(query, candidate_limit=max(candidate_limit * 2, 8), parsed=parsed):
+    for item in [*search_reference_candidates(query, candidate_limit=max(candidate_limit * 2, 8), parsed=parsed), *search_geo_candidates(query, candidate_limit=candidate_limit, parsed=parsed)]:
         _merge_item(item)
 
     raw_ids: list[tuple[str, str]] = []
@@ -1252,6 +1255,155 @@ def _resolve_asset_type(url: str | None, explicit: str | None = None) -> str:
     return "APT"
 
 
+def describe_unresolved_hints(query: str | None, *, candidate_limit: int = 3, parsed: ParsedQuery | None = None) -> list[dict[str, Any]]:
+    """ID 없이 인식된 reference 힌트만 반환한다 (offline: 로컬 seed 파일만 읽음)."""
+    if not str(query or "").strip():
+        return []
+    try:
+        rows = search_reference_candidates(str(query), candidate_limit=max(1, candidate_limit), parsed=parsed)
+    except Exception:
+        return []
+    seen: set[str] = set()
+    hints: list[dict[str, Any]] = []
+    for row in rows:
+        if str(row.get("complex_id") or "").strip():
+            continue
+        key = normalize_complex_alias(str(row.get("name") or ""))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        hints.append(row)
+        if len(hints) >= max(1, candidate_limit):
+            break
+    return hints
+
+
+def build_unresolved_error(query: str | None, parsed: ParsedQuery | None = None) -> str:
+    base = "단지 ID를 찾지 못했습니다. 더 구체적인 단지명/지역명을 주거나 단지 URL/ID를 직접 넣어 주세요."
+    hints = describe_unresolved_hints(query, parsed=parsed)
+    if not hints:
+        return base
+    lines = [base]
+    for hint in hints:
+        name = str(hint.get("name") or "").strip() or "(이름 미상)"
+        address = str(hint.get("address") or "").strip() or "-"
+        lines.append(f"인식된 후보: {name} | {address}")
+        action = str(hint.get("next_action") or "").strip()
+        if not action:
+            action = "네이버 단지 페이지 URL(complexes/<ID>)을 확보해 --url / --complex-id 로 조회해 주세요."
+        lines.append(f"다음 행동: {action}")
+    return "\n".join(lines)
+
+
+def build_geo_anchor(parsed: ParsedQuery | None) -> tuple[str, str] | None:
+    """Return (hint_name, geocode_place_label) for marker grid search, or None."""
+    if parsed is None:
+        return None
+    for hint in describe_unresolved_hints(parsed.raw_query, parsed=parsed):
+        district = str(hint.get("district") or "").strip()
+        neighborhood = str(hint.get("neighborhood") or "").strip()
+        if neighborhood:
+            label = " ".join(part for part in ["서울특별시", district, neighborhood] if part)
+            return (str(hint.get("name") or ""), f"{label}, 대한민국")
+    dong = next((h for h in (parsed.location_hints or []) if h.endswith(("동", "읍", "면"))), "")
+    gu = next((h for h in (parsed.location_hints or []) if h.endswith(("구", "시", "군"))), "")
+    if dong:
+        label = " ".join(part for part in ["서울특별시", gu, dong] if part)
+        return ("", f"{label}, 대한민국")
+    return None
+
+
+def _marker_name_ok(keyword: str, marker_name: str) -> bool:
+    kw = normalize_complex_alias(keyword)
+    nm = normalize_complex_alias(marker_name)
+    if not kw or not nm:
+        return False
+    if kw == nm:
+        return True
+    if kw in nm and len(kw) >= 4:
+        return True
+    return nm in kw and len(nm) >= 4
+
+
+def search_geo_candidates(query: str, *, candidate_limit: int = 3, parsed: ParsedQuery | None = None) -> list[dict[str, Any]]:
+    """Grid-search single-markers around the query locality and match names.
+
+    Best-effort: returns [] when geocoding fails, the API is rate-limited,
+    or no detail-verified name match is found. Never raises.
+    """
+    parsed = parsed or parse_natural_query(query)
+    if RATE_LIMIT_STATE.get("active"):
+        return []
+    anchor = build_geo_anchor(parsed)
+    if anchor is None:
+        return []
+    hint_name, place = anchor
+    try:
+        coords = _geo_markers.geocode_place(place)
+    except Exception:
+        return []
+    if coords is None:
+        return []
+    lat, lon = coords
+    zoom = 14
+    bounds = _geo_markers.viewport_bounds(lat, lon, zoom)
+    keywords = [key for key in [hint_name, *(parsed.candidate_keywords or [])] if str(key or "").strip()][:3]
+    if not keywords:
+        return []
+    needles = [h for h in (parsed.location_hints or []) if len(h) >= 2]
+    needles += [token for token in place.replace(",", " ").split() if token not in ("서울특별시", "대한민국") and len(token) >= 2]
+    trade_order = list(dict.fromkeys([*(parsed.trade_types or []), "매매", "전세"]))[:2]
+    found: list[dict[str, Any]] = []
+    for trade in trade_order:
+        try:
+            payload = _request_json(
+                _geo_markers.build_single_markers_url(
+                    asset_type="APT", trade_type=trade, zoom=zoom,
+                    left_lon=bounds["leftLon"], right_lon=bounds["rightLon"],
+                    top_lat=bounds["topLat"], bottom_lat=bounds["bottomLat"],
+                ),
+                backoffs=[],
+            )
+        except SearchError:
+            return found
+        if not isinstance(payload, list):
+            continue
+        for raw in payload[:80]:
+            if not isinstance(raw, dict):
+                continue
+            info = _geo_markers.normalize_marker_row(raw, asset_type="APT")
+            cid = str(info.get("complex_id") or "").strip()
+            if not cid:
+                continue
+            matched_keyword = next((key for key in keywords if _marker_name_ok(key, str(info.get("name") or ""))), "")
+            if not matched_keyword:
+                continue
+            try:
+                detail = fetch_complex_info(cid)
+            except Exception:
+                continue
+            verified_name = str(detail.get("name") or "")
+            if not _marker_name_ok(matched_keyword, verified_name) and not _marker_name_ok(verified_name, matched_keyword):
+                continue
+            address = str(detail.get("address") or "")
+            if needles and not any(needle in address for needle in needles):
+                continue
+            score = _score_candidate(
+                {"name": verified_name, "address": address, "household_count": detail.get("household_count"), "aliases": []},
+                matched_keyword, parsed,
+            )
+            found.append({
+                **detail,
+                "match_score": score,
+                "source_term": "geo-markers",
+                "source": "geo-markers",
+                "complex_url": detail.get("complex_url") or build_complex_url(cid),
+            })
+            if len(found) >= max(1, candidate_limit):
+                return found
+    return found
+
+
 def run_query(*, query: str | None, complex_id: str | None, url: str | None, trade_types: list[str] | None, pages: int, limit: int, candidate_limit: int, min_pyeong: float | None, max_pyeong: float | None, compare: bool, asset_type: str | None = None, include_pre: bool = False) -> dict[str, Any]:
     parsed = parse_natural_query(query or "") if query else None
     trade_types = list(trade_types or [])
@@ -1263,7 +1415,7 @@ def run_query(*, query: str | None, complex_id: str | None, url: str | None, tra
 
     complex_ids = resolve_complex_ids(query, complex_id, url, candidate_limit=max(1, candidate_limit))
     if not complex_ids:
-        raise SearchError("단지 ID를 찾지 못했습니다. 더 구체적인 단지명/지역명을 주거나 단지 URL/ID를 직접 넣어 주세요.")
+        raise SearchError(build_unresolved_error(query, parsed))
 
     compare_mode = compare or bool(parsed and parsed.compare_mode and len(complex_ids) >= 2)
     target_ids = complex_ids[: max(1, candidate_limit if compare_mode else 1)]
@@ -1503,6 +1655,10 @@ def main() -> int:
         return 0
 
     trade_types = [token.strip() for token in str(args.trade_types).split(",") if token.strip()]
+    if not trade_types and args.url:
+        fin_hints = _geo_markers.parse_fin_map_url(args.url)
+        if fin_hints.get("trade_types"):
+            trade_types = [str(item) for item in fin_hints["trade_types"]]
 
     if args.list_candidates:
         if not args.query:

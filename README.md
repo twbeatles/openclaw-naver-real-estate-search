@@ -48,10 +48,11 @@ OpenClaw AI 에이전트의 스킬로 직접 마운트하거나, 독립 CLI 도�
 - 🧠 **스마트 자연어 질의 파싱 (NLP Parsing)**:
   - 단지명, 지역명, 거래유형(매매/전세/월세), 평형 범위(예: `30평대` → `27~33평`, `84㎡` 자동 치환)를 완벽하게 분리 추출.
   - 매물 번호(Article ID)나 단지/매물 URL 직접 입력 시에도 자동 단지 역조회(Reverse Lookup) 지원.
-- 🎯 **3단계 초고속 단지 후보 탐색 파이프라인**:
+- 🎯 **4단계 초고속 단지 후보 탐색 파이프라인**:
   - `1단계`: 로컬 고속 캐시 (`data/candidate-cache.json`)
   - `2단계`: 사전 검증된 단지 시드 DB (`references/candidate-seeds.json`)
-  - `3단계`: 네이버 포털 웹 검색 결과 실시간 HTML 파싱
+  - `3단계`: 지오 마커 탐색 (seed 지역/위치 힌트 지오코딩 → `single-markers` viewport 단지명 매칭 → 단지 상세 API 검증)
+  - `4단계`: 네이버 포털 웹 검색 결과 실시간 HTML 파싱
 - ⚖️ **동일 평형 기준 단지 비교 (Same-Pyeong Gap Analysis)**:
   - 2개 이상의 단지를 비교할 때 평형대(20평대, 30평대, 전용면적)를 정규화하여 평당가, 최저 호가, 단지 간 가격 갭(Gap)을 자동 산출.
 - 💬 **채팅/메신저 최적화 한국어 브리핑**:
@@ -162,7 +163,7 @@ flowchart TD
 1. **질의 분석**: 자연어에서 거래 방식(`매매/전세/월세`), 면적 조건(`30평대` 등), 단지명을 정규식 기반으로 분류.
 2. **단지 식별 (Resolution)**:
    - 캐시(`candidate-cache.json`) 또는 시드(`candidate-seeds.json`)에서 일치하는 단지 고유 번호(Complex ID)를 탐색.
-   - 캐시에 없을 경우 네이버 통합 검색 포털을 스크랩하여 고유 번호 획득 후 캐시에 자동 적재.
+   - 캐시에 없을 경우 지오 마커 탐색(동/구 지오코딩 → single-markers 단지명 매칭 → 상세 API 검증) 또는 네이버 통합 검색 포털 스크랩으로 고유 번호 획득 후 캐시에 자동 적재.
    - 단일 매물 URL/ID가 전달된 경우 [`article_lookup.py`](file:///c:/twbeatles-repos/naver-real-estate-search/scripts/naver_collect/article_lookup.py)가 상위 단지 ID를 역추적.
 3. **매물 데이터 수집**: 네이버 공식 모바일/웹 엔드포인트(`new.land.naver.com/api/articles/...`)를 호출하여 실시간 호가 수집.
 4. **정규화 및 분석**:
@@ -279,7 +280,7 @@ python scripts/watch_real_estate.py check --json
 네이버 부동산의 IP 차단(HTTP 403 Forbidden) 또는 요청 제한(HTTP 429 Too Many Requests)에 직면했을 때, 로컬 Playwright 브라우저를 띄워 정상 세션을 획득하고 API를 호출할 수 있도록 돕습니다.
 
 ```bash
-python scripts/browser_session_helper.py {resolve,capture,fetch} [OPTIONS]
+python scripts/browser_session_helper.py {resolve,capture,fetch,markers} [OPTIONS]
 ```
 
 - **텍스트/URL에서 Canonical 단지 ID 추출 (`resolve`)**:
@@ -294,6 +295,10 @@ python scripts/browser_session_helper.py {resolve,capture,fetch} [OPTIONS]
 - **브라우저 컨텍스트 내 Same-Origin 직접 Fetch (`fetch`)**:
   ```bash
   python scripts/browser_session_helper.py fetch --complex-id 1147 --trade-types 전세 --pages 1 --headless
+  ```
+- **브라우저 컨텍스트 내 Same-Origin 마커 직접 조회 (`markers`)**:
+  ```bash
+  python scripts/browser_session_helper.py markers --lat 37.57002 --lon 127.05467 --zoom 14 --keyword "두산위브" --headless
   ```
 
 ---
@@ -352,13 +357,16 @@ naver-real-estate-search/
 │   └── naver_collect/               # [통신 엔진 모듈]
 │       ├── __init__.py              # naver_collect 패키지 익스포트
 │       ├── site_contract.py         # 네이버 부동산 API URL 및 엔드포인트 규약
+│       ├── geo_markers.py             # 지오코딩 + single-markers viewport 단지명 매칭
 │       ├── article_api.py           # 매물 목록 API 규격 및 페이지네이션 제어
 │       ├── article_lookup.py        # 매물 번호(Article ID) ➔ 단지 ID 역조회
 │       ├── converters.py            # 평형(㎡-평) 변환, 한글 금액 파서, 갭 계산기
 │       ├── response_capture.py      # 네이버 원시 JSON 응답 파싱 및 필드 정규화
 │       └── retry.py                 # 네트워크 재시도 및 지수 백오프 처리기
 ├── tests/
-│   └── test_naver_collect.py        # 수집 엔진 및 변환 로직 단위 테스트 (pytest)
+│   ├── test_naver_collect.py        # 수집 엔진 및 변환 로직 단위 테스트 (pytest)
+│   ├── test_search_resolution.py    # 미확인 단지 힌트 인식/안내 메시지 회귀 테스트
+│   └── test_geo_markers.py          # 지오 탐색 파이프라인 회귀 테스트
 ├── references/
 │   ├── candidate-seeds.json         # 운영 배포된 단지 고유 식별자 시드 DB
 │   ├── candidate-seeds.generated.json # 자동 수집 파이프라인 생성 초안
@@ -395,7 +403,7 @@ naver-real-estate-search/
 본 프로젝트는 무결성을 보장하기 위해 오프라인 단위 테스트와 내장 자가 진단을 제공합니다.
 
 ### 1. Pytest 단위 테스트 슈트
-인터넷 연결 없이 즉시 통과 가능한 11개 이상의 회귀 테스트를 수행합니다.
+인터넷 연결 없이 즉시 통과 가능한 27개의 회귀 테스트를 수행합니다.
 
 ```bash
 # 전체 단위 테스트 실행
@@ -431,6 +439,11 @@ python scripts/apply_generated_seeds.py --self-test
 </details>
 
 ---
+
+<details>
+<summary><b>Q4. 캐시에 없는 아파트도 자연어로 바로 조회되나요?</b></summary>
+자연어 질의에서 seed 지역(동/구)이나 위치 힌트를 지오코딩한 뒤 <code>single-markers</code> viewport에서 단지명을 매칭하고, 단지 상세 API로 이름/주소를 검증한 뒤에만 ID를 확정합니다. 검증에 실패하거나 429 제한이 걸리면 인식된 후보명과 다음 행동(직접 URL/ID 확보)을 에러 메시지에 담아 안내합니다. 재무맵(<code>fin.land.naver.com/map</code>) 공유 URL을 함께 주면 <code>tradeTypes</code>를 거래 필터로 재사용합니다.
+</details>
 
 ## 📄 라이선스 (License)
 

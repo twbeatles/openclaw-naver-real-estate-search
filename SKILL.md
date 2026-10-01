@@ -42,6 +42,7 @@ python skills/naver-real-estate-search/scripts/browser_session_helper.py fetch -
 - local Playwright persistent profile로 네이버 land 세션을 연다.
 - 현재 URL/HTML에서 `complex_id`를 캡처하고 canonical URL을 정리한다.
 - 브라우저 same-origin `fetch`로 detail/articles를 보조 조회해 403/429 환경에서 우회 실마리를 만든다.
+- `markers` 서브커맨드로 single-markers viewport를 same-origin 조회해 자연어 질의의 지역(동/구) 주변 단지명→ID 매칭을 보조한다.
 - 수동으로 로그인/탐색한 뒤 `capture` 결과를 direct seed/lookup에 바로 연결할 수 있다.
 
 ### 1) 핵심 검색 엔진
@@ -202,11 +203,12 @@ python skills/naver-real-estate-search/scripts/chat_real_estate.py --query "잠�
 1. direct complex ID / URL 우선 추출
 2. 자연어에서 비교 대상 / 위치 힌트 / 거래유형 / 평형대 분리
 3. 로컬 candidate cache(alias → complex_id) exact/contains 매칭
-4. 캐시에 없으면 네이버 검색 결과 HTML에서 후보 complex ID 수집
-5. 가능하면 단지 상세 API로 이름/주소/세대수 보강 후 캐시에 적재
-6. 그래도 후보가 비면 `candidate-seeds.json`의 `manual_review_queue` + `seoul-major-complexes.seed-input.json`를 fallback reference로 조회해 **힌트 후보**를 반환
-7. 이름 정규화 / alias 일치 / 지역 힌트 / 질의 토큰 / 세대수 신뢰도 기준으로 점수화
-8. 점수 상위 후보만 반환
+4. 지오 탐색: seed 지역(동/구)이나 위치 힌트를 지오코딩해 single-markers viewport에서 단지명으로 매칭 후 complex ID 확보
+5. 그래도 없으면 네이버 검색 결과 HTML에서 후보 complex ID 수집
+6. 가능하면 단지 상세 API로 이름/주소/세대수 보강 후 캐시에 적재
+7. 그래도 후보가 비면 `candidate-seeds.json`의 `manual_review_queue` + `seoul-major-complexes.seed-input.json`를 fallback reference로 조회해 **힌트 후보**를 반환
+8. 이름 정규화 / alias 일치 / 지역 힌트 / 질의 토큰 / 세대수 신뢰도 기준으로 점수화
+9. 점수 상위 후보만 반환
 
 `신월시영아파트 ↔ 신월시영` 같은 축약/별칭 차이를 줄이기 위해 공백 제거 + suffix 제거 + alias 확장을 같이 사용한다.
 
